@@ -603,6 +603,10 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         doesn't =word-expand. ``trap ... EXIT`` removes the temp on every failure.
         The local POSIX backend does the same in-process (``tools.file_operations_native``).
         """
+        from tools.interrupt import is_interrupted
+        # shortcut: an interrupt after this check can race backend commit; upgrade to backend-coordinated cancellation.
+        if is_interrupted():
+            return ExecuteResult(stdout="Write interrupted before backend dispatch", exit_code=1)
         if self._native_read_enabled():
             error = _native_io.atomic_write(self._native_path(path), content.encode("utf-8", "surrogateescape"))
             return ExecuteResult(stdout=error or "", exit_code=1 if error else 0)
@@ -644,10 +648,47 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             'cat > "$tmp"; '
             # new file: umask-default perms instead of mktemp's 0600 (#70856). Runs AFTER cat so a
             # write-masking umask can't EACCES the stream; quoted "=rw" so zsh doesn't =word-expand it.
-            'if [ ! -e "$t" ]; then chmod "=rw" "$tmp" 2>/dev/null || true; fi; '
-            'mv -f "$tmp" "$t"; '
-            "trap - EXIT")
-        return self._exec(script, stdin_data=content)
+            'if [ ! -e "$t" ]; then chmod "=rw" "$tmp" 2>/dev/null || true; fi; ')
+        from tools.environments.local import _IS_WINDOWS
+        if _IS_WINDOWS and getattr(self.env, 'is_local', False):
+            return self._windows_shell_write(script, content)
+        return self._exec(script + 'mv -f "$tmp" "$t"; trap - EXIT', stdin_data=content)
+
+    def _windows_shell_write(self, script: str, content: str) -> ExecuteResult:
+        from tools.interrupt import begin_file_publication, file_settlement_wait, finish_file_publication
+
+        cwd = getattr(self.env, 'cwd', None) or self.cwd
+        staged = self._exec(script + 'printf "\\0%s\\0%s\\0" "$tmp" "$t"; trap - EXIT', cwd=cwd, stdin_data=content)
+        if staged.exit_code:
+            # No destination replacement is part of staging.
+            return ExecuteResult(stdout=staged.stdout, exit_code=1)
+        fields = staged.stdout.split('\x00')
+        if len(fields) != 4 or not fields[1] or not fields[2]:
+            return ExecuteResult(stdout='Could not read staged file paths', exit_code=1)
+        tmp, target = map(self._escape_shell_arg, fields[1:3])
+        publication = begin_file_publication()
+        token = file_settlement_wait.set(True)
+        outcome = 'unknown'
+        try:
+            if publication is None:
+                cleanup = self._exec(f'rm -f -- {tmp}', cwd=cwd, timeout=10)
+                detail = f'; temporary file cleanup failed: {cleanup.stdout}' if cleanup.exit_code else ''
+                return ExecuteResult(stdout='Write interrupted before final replacement' + detail, exit_code=1)
+            result = self._exec(f'mv -f -- {tmp} {target}', cwd=cwd, timeout=15)
+            if result.exit_code:
+                # A timeout or backend failure may follow the actual rename.
+                if result.exit_code not in (124, 130):
+                    cleanup = self._exec(f'if [ -f {tmp} ]; then rm -f -- {tmp} && printf "%s" uncommitted; fi', cwd=cwd, timeout=10)
+                    if cleanup.exit_code == 0 and cleanup.stdout == 'uncommitted':
+                        outcome = 'not_written'
+                        return result
+                return ExecuteResult(stdout=result.stdout, exit_code=130)
+            outcome = 'written'
+            return result
+        finally:
+            file_settlement_wait.reset(token)
+            if publication is not None:
+                finish_file_publication(publication, outcome)
 
     def _file_has_bom(self, path: str, pre_content: Optional[str] = None) -> bool:
         """Whether the on-disk file starts with a UTF-8 BOM. ALWAYS probes disk:
@@ -1575,6 +1616,10 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         content_bytes = content.encode("utf-8", "surrogateescape")
         write_result = self._atomic_write(path, content)
         if write_result.exit_code != 0:
+            if write_result.exit_code == 130:
+                return WriteResult(bytes_written=None, error=(
+                    f"Failed to write file: {write_result.stdout}; commit status unknown; "
+                    "re-read the file before retrying"))
             return WriteResult(error=f"Failed to write file: {write_result.stdout}")
         content_verified, verify_error = self._verify_written_hash(path, content_bytes)
         if verify_error is not None:

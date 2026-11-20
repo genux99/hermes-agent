@@ -3245,6 +3245,8 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                 # BadRequest subclasses NetworkError in PTB but is permanent; handle specific cases.
                 if _BadReq and isinstance(send_err, _BadReq):
                     if topic_gone(chat_id, send_err) and (effective_thread_id or (private_chat(chat_id) and thread_kwargs.get("direct_messages_topic_id"))):
+                        if metadata and metadata.get("strict_file_settlement_topic"):
+                            return SendResult(success=False, error=str(send_err), retryable=False)
                         if metadata and metadata.get("telegram_dm_topic_created_for_send"):
                             return SendResult(success=False, error=str(send_err), retryable=False)
                         # A one-off "thread not found" flake retries the same thread_id before any route change.

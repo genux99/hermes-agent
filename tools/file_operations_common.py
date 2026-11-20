@@ -43,7 +43,7 @@ class ReadResult:
 @dataclass
 class WriteResult:
     """Result from writing a file."""
-    bytes_written: int = 0
+    bytes_written: Optional[int] = 0
     dirs_created: bool = False
     # True when the on-disk sha256 matched the intended content; None when the
     # backend couldn't verify (no sha256sum). A mismatch is a hard error, never a flag.

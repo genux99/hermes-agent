@@ -7,6 +7,7 @@ import contextvars
 import logging
 import threading
 from collections.abc import Callable
+from concurrent.futures import Future
 
 from utils import env_var_enabled
 
@@ -32,6 +33,35 @@ _lock = threading.Lock()
 acting_for_tid: contextvars.ContextVar[int | None] = contextvars.ContextVar(
     "hermes_interrupt_acting_for_tid", default=None,
 )
+
+
+file_settlement_wait = contextvars.ContextVar('hermes_file_settlement_wait', default=False)
+_file_publications: dict[int, Future[str]] = {}
+
+
+def begin_file_publication() -> tuple[int, Future[str]] | None:
+    current = threading.get_ident()
+    owner = acting_for_tid.get() or current
+    with _lock:
+        if current in _interrupted_threads or owner in _interrupted_threads or owner in _file_publications:
+            return None
+        receipt: Future[str] = Future()
+        _file_publications[owner] = receipt
+        return owner, receipt
+
+
+def pending_file_publication(owner: int | None) -> Future[str] | None:
+    if owner is None:
+        return None
+    with _lock:
+        return _file_publications.get(owner)
+
+
+def finish_file_publication(publication: tuple[int, Future[str]], outcome: str) -> None:
+    owner, receipt = publication
+    receipt.set_result(outcome)
+    with _lock:
+        del _file_publications[owner]
 
 
 def set_interrupt(active: bool, thread_id: int | None = None, *, reason: str | None = None) -> None:

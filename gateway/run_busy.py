@@ -1183,10 +1183,12 @@ class GatewayBusySessionMixin:
         # Hard-kill: a soft interrupt can't reach a truly hung executor thread.
         from gateway.run import _INTERRUPT_REASON_STOP
         await _busy_accepted()
-        await self._interrupt_and_clear_session(
+        settling = await self._interrupt_and_clear_session(
             quick_key, source, interrupt_reason=_INTERRUPT_REASON_STOP, invalidation_reason="stop_command",
         )
         logger.info("STOP for session %s — agent interrupted, session lock released", quick_key)
+        if settling is True:
+            return EphemeralReply('Stop requested. A file write is still settling.')
         return EphemeralReply(t("gateway.stop.stopped"))
 
     async def _busy_new_command(self, event: MessageEvent, quick_key: str, source):

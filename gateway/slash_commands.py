@@ -440,8 +440,8 @@ class GatewaySlashCommandsMixin(
         session_key = session_entry.session_key
         await self._hm_stop_owner_turn(session_key)  # also between turns, before the next claim (N53)
 
-        async def _stop(key: str, invalidation_reason: str) -> None:
-            await self._interrupt_and_clear_session(
+        async def _stop(key: str, invalidation_reason: str) -> bool:
+            return await self._interrupt_and_clear_session(
                 key, source, interrupt_reason=_INTERRUPT_REASON_STOP,
                 invalidation_reason=invalidation_reason)
         # A turn the app started while the chat was elsewhere still runs on its own key (/resume).
@@ -453,7 +453,8 @@ class GatewaySlashCommandsMixin(
             logger.info("STOP (pending) for session %s — sentinel cleared", run_key)
             return EphemeralReply(t("gateway.stop.stopped_pending"))
         if agent:  # force-clean the session lock so a truly hung agent doesn't keep it forever
-            await _stop(run_key, "stop_command_handler")
+            if await _stop(run_key, "stop_command_handler") is True:
+                return EphemeralReply('Stop requested. A file write is still settling.')
             return EphemeralReply(t("gateway.stop.stopped"))
 
         # No run under the caller's own key: a live turn in THIS chat may still carry a differently
@@ -473,10 +474,13 @@ class GatewaySlashCommandsMixin(
             else "stop_command_chat_scope"
         )
         if fallback_keys and self._is_user_authorized_for_source(source):
+            settling = False
             for fallback_key in fallback_keys:
-                await _stop(fallback_key, reason)
+                settling = (await _stop(fallback_key, reason) is True) or settling
             logger.info("STOP (%s) by %s — interrupted %d run(s): %s",
                         reason, session_key, len(fallback_keys), ", ".join(fallback_keys))
+            if settling:
+                return EphemeralReply('Stop requested. A file write is still settling.')
             return EphemeralReply(t("gateway.stop.stopped"))
 
         # No running agent anywhere for this scope. Background delegations the session dispatched in an
