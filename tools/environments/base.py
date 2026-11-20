@@ -587,6 +587,8 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
         """
         if output is None:
             output = _new_output_collector(proc, bounded_capture)
+        from tools.interrupt import file_settlement_wait
+        settle_file_write = file_settlement_wait.get()
         drain_stop = threading.Event() if yield_handler is not None else None
         drain_thread = _start_drain_thread(proc, output, drain_stop)
         _now = time.monotonic()
@@ -607,7 +609,7 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
             _fast_until = time.monotonic() + 0.05
             while proc.poll() is None:
                 trace.iterations += 1
-                if is_interrupted() or is_thread_interrupted(watch_interrupt_tid):
+                if not settle_file_write and (is_interrupted() or is_thread_interrupted(watch_interrupt_tid)):
                     trace.interrupted()
                     _kill_and_join()
                     return {**self._finalize_wait_result(output, output.render(suffix="\n[Command interrupted]"), 130),

@@ -4,6 +4,7 @@ for GatewayRunner (MRO mixin). ``gateway.run`` internals are imported lazily ins
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import logging
 import threading
@@ -545,18 +546,23 @@ class GatewayAgentCacheMixin:
     async def _interrupt_and_clear_session(
         self, session_key: str, source: SessionSource, *, interrupt_reason: str,
         invalidation_reason: str, release_running_state: bool = True,
-    ) -> None:
-        """Interrupt the current run and clear queued session state consistently."""
+    ) -> bool:
+        """Interrupt and clear the run. Return whether a file receipt is pending."""
         if not session_key:
-            return
+            return False
         state = self._peek_session_state(session_key)
         running_agent = state.turn.agent if state else None
+        from tools.interrupt import pending_file_publication
+        tid = getattr(running_agent, '_execution_thread_id', None)
+        receipt = pending_file_publication(tid)
         from gateway.run_plugin_injection import person_input_joined_turn
         person_input_joined_turn(self, session_key)  # /stop, /new: a plugin turn's wait ends at once
         _generation_at_interrupt = self._interrupt_running_turn(
             session_key, interrupt_reason=interrupt_reason, invalidation_reason=invalidation_reason,
         )
-        from gateway.run import _AGENT_PENDING_SENTINEL
+        receipt = receipt or pending_file_publication(tid)
+        from gateway.run import _AGENT_PENDING_SENTINEL, _INTERRUPT_REASON_STOP
+        settling = receipt is not None and interrupt_reason == _INTERRUPT_REASON_STOP
         if running_agent is _AGENT_PENDING_SENTINEL:
             # No agent to interrupt yet: end the setup itself, or the turn keeps its FIFO claim (#138358).
             from gateway.run_turn_setup_guard import cancel_preagent_setup
@@ -617,6 +623,22 @@ class GatewayAgentCacheMixin:
             # Guarded release: a message that arrived during the awaits above may already run as
             # the successor generation — the displaced /stop tail must not wipe its slot.
             self._drop_turn_slot(session_key, run_generation=_generation_at_interrupt)
+
+        if settling and adapter:
+            async def notify_file_settlement():
+                outcome = await asyncio.shield(asyncio.wrap_future(receipt))
+                text = {
+                    'written': 'File write completed.',
+                    'not_written': 'File replacement failed. The staged content was not published.',
+                    'unknown': 'File write outcome is unknown. Read the file before retrying.',
+                }[outcome]
+                metadata = self._thread_metadata_for_source(source) or {}
+                if source.platform == Platform.TELEGRAM and source.thread_id:
+                    metadata = {**metadata, 'strict_file_settlement_topic': True}
+                await adapter.send(source.chat_id, text, metadata=metadata)
+
+            self._track_background_task(notify_file_settlement())
+        return settling
 
     async def _refresh_agent_cache_message_count(self, session_key: str, session_id: Optional[str]) -> None:
         """Re-baseline a cached agent's stored message_count after THIS turn — the coherence guard
